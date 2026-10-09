@@ -33,5 +33,17 @@
     ],
     "confidence": 0.92,
     "reasoning": "The open drainage ditch contains significant accumulation of dark silt, plastic wrappers, and organic debris that impede flow."
+  },
+  "8cdcf0f90bca614f832819db28c60a9d": {
+    "blockage_percent": 70,
+    "severity": "severe",
+    "debris_types": [
+      "construction waste",
+      "plastic",
+      "silt",
+      "textiles"
+    ],
+    "confidence": 0.92,
+    "reasoning": "The drain structure has severely collapsed with exposed rebar and concrete rubble falling into the channel alongside heavy accumulated trash."
   }
 }

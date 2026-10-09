@@ -9,7 +9,9 @@ import hashlib
 import json
 import os
 import random
+import smtplib
 import time
+from email.message import EmailMessage
 
 import pandas as pd
 import pydeck as pdk
@@ -110,6 +112,100 @@ def forecast_max_rain(lat: float, lon: float) -> float:
         return 0.0
 
 
+# ---------- Alerts: Telegram + email ----------
+def get_secret(name: str) -> str:
+    """Read a setting from environment variables or Streamlit secrets."""
+    v = os.environ.get(name, "")
+    if not v:
+        try:
+            v = str(st.secrets[name])
+        except Exception:
+            v = ""
+    return v
+
+
+def build_alert(rows, rain_mm: float, sensor_cm=None) -> str:
+    lines = [f"FLOOD RISK ALERT - {time.strftime('%d %b %Y %H:%M')}",
+             f"Rainfall: {rain_mm:.0f} mm/hr", ""]
+    for _, r in rows.iterrows():
+        lines.append(f"{r['name']} ({r['id']}): {r['blockage_%']}% blocked, "
+                     f"debris: {r['debris'] or 'n/a'}, risk {r['risk']} ({r['level']})")
+        lines.append(f"Location: https://maps.google.com/?q={r['lat']},{r['lon']}")
+    if sensor_cm is not None:
+        lines.append(f"\nSensor water level ({SENSOR_DRAIN}): {sensor_cm:.1f} cm")
+    lines.append("\nAction: send a crew to clear the drain(s) above before the rain peaks.")
+    lines.append("Source: Smart Drain Monitor (hackathon demo, sample locations).")
+    return "\n".join(lines)
+
+
+def send_telegram(text: str):
+    token, chat = get_secret("TELEGRAM_TOKEN"), get_secret("TELEGRAM_CHAT_ID")
+    if not token or not chat:
+        return None
+    try:
+        r = requests.post(f"https://api.telegram.org/bot{token}/sendMessage",
+                          data={"chat_id": chat, "text": text}, timeout=10)
+        return r.ok, ("sent" if r.ok else r.text[:120])
+    except Exception as e:
+        return False, str(e)[:120]
+
+
+def send_email(subject: str, body: str):
+    user, pwd, to = get_secret("SMTP_USER"), get_secret("SMTP_APP_PASSWORD"), get_secret("ALERT_EMAIL_TO")
+    if not (user and pwd and to):
+        return None
+    try:
+        m = EmailMessage()
+        m["Subject"], m["From"], m["To"] = subject, user, to      # "to" can be comma-separated
+        m.set_content(body)
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=15) as srv:
+            srv.login(user, pwd)
+            srv.send_message(m)
+        return True, "sent"
+    except Exception as e:
+        return False, str(e)[:120]
+
+
+def send_alerts(text: str) -> dict:
+    out = {}
+    for name, res in (("Telegram", send_telegram(text)),
+                      ("Email", send_email("Flood risk alert: blocked drain(s)", text))):
+        if res is not None:
+            out[name] = res
+    return out
+
+
+@st.cache_resource
+def mqtt_listener(topic: str, host: str = "broker.hivemq.com", port: int = 1883, user: str = "", pwd: str = ""):
+    """Background MQTT subscriber (public HiveMQ broker, no sign-up). Returns a dict that updates live."""
+    state = {"level": None, "time": None, "error": None}
+    try:
+        import paho.mqtt.client as mqtt
+
+        def on_connect(client, userdata, flags, reason_code, properties=None):
+            client.subscribe(topic)
+
+        def on_message(client, userdata, msg):
+            try:
+                state["level"] = float(msg.payload.decode().strip())
+                state["time"] = time.time()
+            except ValueError:
+                pass
+
+        client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
+        client.on_connect = on_connect
+        client.on_message = on_message
+        if user:
+            client.username_pw_set(user, pwd)
+        if port in (8883, 8884):
+            client.tls_set()
+        client.connect(host, int(port), 60)
+        client.loop_start()
+    except Exception as e:
+        state["error"] = str(e)
+    return state
+
+
 @st.cache_data(ttl=10, show_spinner=False)
 def read_thingspeak(channel_id: str, api_key: str = ""):
     """Latest water level (cm) from field1 of a ThingSpeak channel, or None."""
@@ -142,16 +238,35 @@ st.sidebar.metric("Forecast peak (next 24h)", f"{live_rain:.1f} mm/hr")
 simulate = st.sidebar.checkbox("Simulate heavy rain")
 rain = st.sidebar.slider("Simulated rain (mm/hr)", 0, 50, 25) if simulate else live_rain
 
-# ---------- IoT sensor (simulated, or real ESP32 via ThingSpeak) ----------
+# ---------- IoT sensor (simulated, or real ESP32 via MQTT / ThingSpeak) ----------
 st.sidebar.header("IoT sensor")
-sensor_src = st.sidebar.radio("Source", ["Simulated", "ThingSpeak (real ESP32)"])
+sensor_src = st.sidebar.radio("Source", ["Simulated", "MQTT (real ESP32, no sign-up)", "ThingSpeak (real ESP32)"])
 st.session_state.setdefault("sensor_hist", [])
+ch = ""      # ThingSpeak channel (set below if used)
+topic = ""   # MQTT topic (set below if used)
+mq_host, mq_user = "", ""
 hist = st.session_state["sensor_hist"]
 if sensor_src == "Simulated":
     sim_block = st.sidebar.checkbox("Simulate blockage")
     last = hist[-1] if hist else 8.0
     target = 50 if sim_block else 8
     level_cm = max(0.0, last + (target - last) * 0.35 + random.uniform(-1, 1))
+elif sensor_src.startswith("MQTT"):
+    mq_host = st.sidebar.text_input("MQTT broker", "broker.hivemq.com")
+    mq_port = st.sidebar.number_input("Port", value=1883, step=1)
+    mq_user = st.sidebar.text_input("Username (if required)")
+    mq_pwd = st.sidebar.text_input("Password (if required)", type="password")
+    topic = st.sidebar.text_input("MQTT topic", "drainai-demo-7421/level")
+    st.sidebar.caption("Use your friend's broker, port, topic and login. The value must be the water "
+                       "level in cm as plain text, e.g. 30 (not JSON).")
+    mq = mqtt_listener(topic, mq_host, int(mq_port), mq_user, mq_pwd) if topic and mq_host else None
+    level_cm = mq["level"] if mq else None
+    if mq and mq["error"]:
+        st.sidebar.warning("MQTT error: " + mq["error"][:80])
+    elif topic and level_cm is None:
+        st.sidebar.info("Connected. Waiting for the first reading...")
+    elif mq and mq["time"]:
+        st.sidebar.caption(f"Last message {int(time.time() - mq['time'])} s ago")
 else:
     ch = st.sidebar.text_input("ThingSpeak channel ID")
     key = st.sidebar.text_input("Read API key (only if channel is private)", type="password")
@@ -164,6 +279,10 @@ if level_cm is not None:
     st.sidebar.metric(f"Water level ({SENSOR_DRAIN})", f"{level_cm:.1f} cm",
                       "BLOCKED" if level_cm >= SENSOR_BLOCK_CM else "clear", delta_color="off")
 auto_refresh = st.sidebar.checkbox("Auto-refresh sensor (10 s)")
+
+st.sidebar.header("Alerts")
+auto_alert = st.sidebar.checkbox("Auto-send alert when a drain turns HIGH")
+cooldown_min = st.sidebar.number_input("Don't repeat for the same drain (minutes)", 1, 240, 30)
 
 # ---------- Analyze drains ----------
 if "results" not in st.session_state:
@@ -210,55 +329,92 @@ for d in DRAINS:
     })
 df = pd.DataFrame(rows).sort_values("risk", ascending=False)
 
-# ---------- Alerts ----------
-high = df[df["level"] == "HIGH"]
-if len(high):
-    st.error(f"ALERT: {len(high)} drain(s) at high flood risk with {rain:.0f} mm/hr rain expected. Dispatch crews now.")
-    for _, r in high.iterrows():
-        st.write(f"- **{r['name']}**: {r['blockage_%']}% blocked ({r['debris']}), risk {r['risk']}")
-else:
-    st.success("No drains at high risk under current rainfall.")
+tab_vision, tab_iot = st.tabs(["Vision & flood risk", "IoT live dashboard"])
 
-# ---------- Map + ranked list ----------
-c1, c2 = st.columns([3, 2])
-with c1:
-    layer = pdk.Layer("ScatterplotLayer",
-                      df[["lat", "lon", "color", "name", "blockage_%", "risk", "level"]],
-                      get_position="[lon, lat]", get_fill_color="color",
-                      get_radius=120, radius_min_pixels=12, pickable=True)
-    st.pydeck_chart(pdk.Deck(
-        layers=[layer],
-        initial_view_state=pdk.ViewState(latitude=BASE_LAT, longitude=BASE_LON, zoom=14),
-        tooltip={"text": "{name}\nBlockage: {blockage_%}%\nRisk: {risk} ({level})"},
-    ))
-with c2:
-    st.subheader("Maintenance priority")
-    st.dataframe(df[["name", "blockage_%", "debris", "risk", "level"]],
-                 hide_index=True, use_container_width=True)
-
-# ---------- Drain detail + simulated sensor ----------
-st.subheader("Drain detail")
-choice = st.selectbox("Select drain", df["name"])
-sel = df[df["name"] == choice].iloc[0]
-d1, d2 = st.columns(2)
-with d1:
-    st.image(sel["file"], caption=f"{sel['severity']} - {sel['why']}")
-with d2:
-    if sel["id"] == SENSOR_DRAIN and hist:
-        st.caption("Water level sensor (" + ("SIMULATED" if sensor_src == "Simulated" else "LIVE via ThingSpeak") + ")")
-        st.line_chart(hist)
+with tab_vision:
+    # ---------- Alerts ----------
+    high = df[df["level"] == "HIGH"]
+    if len(high):
+        st.error(f"ALERT: {len(high)} drain(s) at high flood risk with {rain:.0f} mm/hr rain expected. Dispatch crews now.")
+        for _, r in high.iterrows():
+            st.write(f"- **{r['name']}**: {r['blockage_%']}% blocked ({r['debris']}), risk {r['risk']}")
+        sent = st.session_state.setdefault("alerted", {})          # drain id -> time last alerted
+        now = time.time()
+        fresh = high[high["id"].map(lambda i: now - sent.get(i, 0) > cooldown_min * 60)]
+        with st.expander("Alert message preview"):
+            st.code(build_alert(high, rain, level_cm))
+        send_now = st.button("Send alert now (maintenance team / authorities)")
+        if send_now or (auto_alert and len(fresh)):
+            targets = high if send_now else fresh
+            results_sent = send_alerts(build_alert(targets, rain, level_cm))
+            if not results_sent:
+                st.warning("No alert channel configured. Set TELEGRAM_TOKEN + TELEGRAM_CHAT_ID "
+                           "and/or SMTP_USER + SMTP_APP_PASSWORD + ALERT_EMAIL_TO.")
+            else:
+                for i in targets["id"]:
+                    sent[i] = now
+                for channel, (ok, info) in results_sent.items():
+                    (st.success if ok else st.warning)(f"{channel}: {info}")
     else:
-        st.caption("Water level sensor (SIMULATED)")
-        random.seed(sel["id"])
-        base = 18
-        st.line_chart([base + random.uniform(-1.5, 1.5) + i * sel["blockage_%"] / 100 * 0.9 for i in range(24)])
+        st.success("No drains at high risk under current rainfall.")
+
+    # ---------- Map + ranked list ----------
+    c1, c2 = st.columns([3, 2])
+    with c1:
+        layer = pdk.Layer("ScatterplotLayer",
+                          df[["lat", "lon", "color", "name", "blockage_%", "risk", "level"]],
+                          get_position="[lon, lat]", get_fill_color="color",
+                          get_radius=120, radius_min_pixels=12, pickable=True)
+        st.pydeck_chart(pdk.Deck(
+            layers=[layer],
+            initial_view_state=pdk.ViewState(latitude=BASE_LAT, longitude=BASE_LON, zoom=14),
+            tooltip={"text": "{name}\nBlockage: {blockage_%}%\nRisk: {risk} ({level})"},
+        ))
+    with c2:
+        st.subheader("Maintenance priority")
+        st.dataframe(df[["name", "blockage_%", "debris", "risk", "level"]],
+                     hide_index=True, use_container_width=True)
+
+    # ---------- Drain detail + simulated sensor ----------
+    st.subheader("Drain detail")
+    choice = st.selectbox("Select drain", df["name"])
+    sel = df[df["name"] == choice].iloc[0]
+    d1, d2 = st.columns(2)
+    with d1:
+        st.image(sel["file"], caption=f"{sel['severity']} - {sel['why']}")
+    with d2:
+        if sel["id"] == SENSOR_DRAIN and hist:
+            st.caption("Water level sensor (" + ("SIMULATED" if sensor_src == "Simulated" else "LIVE sensor") + ")")
+            st.line_chart(hist)
+        else:
+            st.caption("Water level sensor (SIMULATED)")
+            random.seed(sel["id"])
+            base = 18
+            st.line_chart([base + random.uniform(-1.5, 1.5) + i * sel["blockage_%"] / 100 * 0.9 for i in range(24)])
 
 
-# ---------- Embedded browser dashboard (MQTT / ThingSpeak live view) ----------
-if os.path.exists("drain_guard.html"):
-    with st.expander("Live IoT dashboard (MQTT view, runs in the browser)"):
+
+with tab_iot:
+    st.caption("Browser dashboard: sample-drain map plus a live sensor view (MQTT / ThingSpeak). "
+               "A ThingSpeak channel ID entered in the sidebar is passed in automatically, "
+               "so this tab and the risk score read the same sensor.")
+    if os.path.exists("drain_guard.html"):
         with open("drain_guard.html", encoding="utf-8") as f:
-            components.html(f.read(), height=1500, scrolling=True)
+            html = f.read()
+        if html.lstrip().startswith("!DOCTYPE"):          # fix a pasted first line missing "<"
+            html = "<" + html.lstrip()
+        html = html.replace("const CENTER = [12.9716, 77.5946];",
+                            f"const CENTER = [{BASE_LAT}, {BASE_LON}];")   # same city as the app
+        js = ""
+        if ch:
+            js += 'document.getElementById("chId").value=' + json.dumps(ch) + ';document.getElementById("connectBtn").click();'
+        if topic and mq_host == "broker.hivemq.com" and not mq_user:   # dashboard tab only supports the public HiveMQ broker
+            js += 'document.getElementById("mqttTopic").value=' + json.dumps(topic) + ';document.getElementById("mqttBtn").click();'
+        if js:
+            html = html.replace("</body>", "<script>" + js + "</script></body>")
+        components.html(html, height=1500, scrolling=True)
+    else:
+        st.warning("drain_guard.html not found. Put it next to app2.py.")
 
 if auto_refresh:
     time.sleep(10)
