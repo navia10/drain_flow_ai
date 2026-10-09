@@ -1,0 +1,37 @@
+{
+  "c6625da6d5c99b37dac60ff75a2b066a": {
+    "blockage_percent": 5,
+    "severity": "clear",
+    "debris_types": [
+      "silt",
+      "plastic",
+      "fabric/clothing",
+      "organic debris"
+    ],
+    "confidence": 0.95,
+    "reasoning": "The outfall pipe opening is clear and discharging freely, though debris and silt accumulate along the discharge bank."
+  },
+  "f444ed3b1bc9f7d6f52b3f82d593102f": {
+    "blockage_percent": 50,
+    "severity": "partial",
+    "debris_types": [
+      "plastic",
+      "silt",
+      "household waste"
+    ],
+    "confidence": 0.9,
+    "reasoning": "Large accumulations of silt and solid waste significantly restrict the channel width and accumulate along the water surface."
+  },
+  "90d09f21e7d7169c0c63e544c3fbafbd": {
+    "blockage_percent": 60,
+    "severity": "partial",
+    "debris_types": [
+      "plastic",
+      "silt",
+      "organic waste",
+      "trash"
+    ],
+    "confidence": 0.92,
+    "reasoning": "The open drainage ditch contains significant accumulation of dark silt, plastic wrappers, and organic debris that impede flow."
+  }
+}
