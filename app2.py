@@ -193,7 +193,7 @@ with c1:
 with c2:
     st.subheader("Maintenance priority")
     st.dataframe(df[["name", "blockage_%", "debris", "risk", "level"]],
-                 hide_index=True, use_container_width=True)
+                 hide_index=True, width="stretch")
 
 # ---------- Drain detail + simulated sensor ----------
 st.subheader("Drain detail")
