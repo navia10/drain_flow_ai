@@ -7,10 +7,12 @@ Put drain photos in a ./drains folder and list them in DRAINS below.
 """
 import hashlib
 import json
+import math
 import os
 import random
 import smtplib
 import time
+from html import escape as esc
 from email.message import EmailMessage
 
 import pandas as pd
@@ -22,10 +24,12 @@ from google import genai
 from google.genai import errors as genai_errors
 from google.genai import types
 
+APP_NAME = "DrainGuard AI"   # change to your project name
 MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.7-flash")
 BASE_LAT, BASE_LON = 28.6139, 77.2090  # TODO: set to your demo area
 SENSOR_DRAIN = "D2"      # which drain the IoT sensor is installed in
 SENSOR_BLOCK_CM = 25     # water level (cm) that counts as blocked
+HISTORY_FILE = "flood_history.csv"   # past overflow records: date,area,lat,lon,description
 CACHE_FILE = "results_cache.json"       # saved Gemini results, survives restarts
 
 # One entry per drain photo. Coordinates are made up around BASE_LAT/LON.
@@ -44,8 +48,32 @@ Return ONLY JSON with these keys:
  "confidence": number 0-1,
  "reasoning": one short sentence}"""
 
-st.set_page_config(page_title="Smart Drain Monitor", layout="wide")
-st.title("AI Smart Drain Blockage Detection")
+st.set_page_config(page_title=APP_NAME, layout="wide")
+CSS = """
+@import url('https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:wght@400;700&family=Bricolage+Grotesque:wght@500;700&display=swap');
+.stApp { background: #F2F5F6; }
+html, body, .stApp, p, label, li, td, th, input { font-family: 'Atkinson Hyperlegible', system-ui, sans-serif; color: #12303B; }
+h1, h2, h3, h4 { font-family: 'Bricolage Grotesque', 'Atkinson Hyperlegible', sans-serif; color: #12303B; letter-spacing: -0.01em; }
+[data-testid="stSidebar"] { background: #E3EAED; }
+.hdr-name { font-family: 'Bricolage Grotesque', sans-serif; font-weight: 700; font-size: 2.1rem; line-height: 1.1; }
+.hdr-sub { color: #46636D; margin-top: 2px; }
+.verdict { border-left: 8px solid var(--c); background: var(--bg); padding: 18px 22px; border-radius: 4px; margin: 14px 0 18px; }
+.v-head { font-family: 'Bricolage Grotesque', sans-serif; font-weight: 700; font-size: 1.75rem; line-height: 1.2; }
+.v-sub { margin-top: 6px; font-size: 1.05rem; }
+.facts { display: flex; gap: 32px; flex-wrap: wrap; margin-top: 14px; }
+.fact b { display: block; font-family: 'Bricolage Grotesque', sans-serif; font-size: 1.5rem; }
+.fact span { color: #46636D; font-size: .92rem; }
+.q-item { border-left: 5px solid; background: #fff; padding: 10px 14px; margin-bottom: 8px; border-radius: 3px; }
+.q-name { font-weight: 700; }
+.q-line { font-size: .93rem; color: #46636D; }
+.q-risk { font-weight: 700; margin-top: 2px; }
+.stButton > button { border-radius: 6px; font-weight: 700; }
+@media (max-width: 700px) { .v-head { font-size: 1.35rem; } .hdr-name { font-size: 1.7rem; } }
+"""
+st.markdown("<style>" + CSS + "</style>", unsafe_allow_html=True)
+st.markdown(f'<div class="hdr-name">{esc(APP_NAME)}</div>'
+            '<div class="hdr-sub">Find the blockage before the flood finds you.</div>', unsafe_allow_html=True)
+st.caption("Drain locations and the sensor feed are sample data. Photo analysis and the rainfall forecast are live.")
 
 
 @st.cache_resource
@@ -112,6 +140,40 @@ def forecast_max_rain(lat: float, lon: float) -> float:
         return 0.0
 
 
+# ---------- Past overflow history ----------
+@st.cache_data(show_spinner=False)
+def load_history():
+    if not os.path.exists(HISTORY_FILE):
+        return None
+    try:
+        h = pd.read_csv(HISTORY_FILE, parse_dates=["date"]).dropna(subset=["lat", "lon", "date"])
+        if "area" not in h:
+            h["area"] = "unknown"
+        return h
+    except Exception:
+        return None
+
+
+def _dist_m(lat1, lon1, lat2, lon2):
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    a = math.sin((p2 - p1) / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(math.radians(lon2 - lon1) / 2) ** 2
+    return 6371000 * 2 * math.asin(math.sqrt(a))
+
+
+def history_for(lat, lon, radius_m=500):
+    """Past overflow incidents near a drain. Recent events count more. Returns None if no history file."""
+    h = load_history()
+    if h is None:
+        return None
+    near = h[h.apply(lambda r: _dist_m(lat, lon, r["lat"], r["lon"]) <= radius_m, axis=1)]
+    if near.empty:
+        return {"count": 0, "last": "none", "weight": 0.3}
+    years = (pd.Timestamp.now() - near["date"]).dt.days / 365.0
+    score = sum(math.exp(-y / 3) for y in years)
+    return {"count": len(near), "last": near["date"].max().strftime("%b %Y"),
+            "weight": round(min(1.0, 0.3 + score / 3), 2)}
+
+
 # ---------- Alerts: Telegram + email ----------
 def get_secret(name: str) -> str:
     """Read a setting from environment variables or Streamlit secrets."""
@@ -131,6 +193,8 @@ def build_alert(rows, rain_mm: float, sensor_cm=None) -> str:
         lines.append(f"{r['name']} ({r['id']}): {r['blockage_%']}% blocked, "
                      f"debris: {r['debris'] or 'n/a'}, risk {r['risk']} ({r['level']})")
         lines.append(f"Location: https://maps.google.com/?q={r['lat']},{r['lon']}")
+        if pd.notna(r.get("past_overflows")):
+            lines.append(f"History: {int(r['past_overflows'])} past overflow(s) within 500 m, last {r['last_overflow']}")
     if sensor_cm is not None:
         lines.append(f"\nSensor water level ({SENSOR_DRAIN}): {sensor_cm:.1f} cm")
     lines.append("\nAction: send a crew to clear the drain(s) above before the rain peaks.")
@@ -216,6 +280,24 @@ def read_thingspeak(channel_id: str, api_key: str = ""):
         return float(j["field1"])
     except Exception:
         return None
+
+
+RISK_COLORS = {"HIGH": "#C8372D", "MEDIUM": "#E39A1C", "LOW": "#2E8B57"}
+
+
+def queue_html(df, limit=6):
+    """Crew queue: most urgent drains first, risk shown by the left edge colour."""
+    items = []
+    for _, r in df.head(limit).iterrows():
+        col = RISK_COLORS[r["level"]]
+        hist = (f'<div class="q-line">{int(r["past_overflows"])} past overflow(s) within 500 m</div>'
+                if pd.notna(r["past_overflows"]) and r["past_overflows"] else "")
+        items.append(
+            f'<div class="q-item" style="border-left-color:{col}">'
+            f'<div class="q-name">{esc(str(r["name"]))}</div>'
+            f'<div class="q-line">{r["blockage_%"]}% blocked, {esc(r["debris"] or "no debris seen")}</div>'
+            f'{hist}<div class="q-risk" style="color:{col}">{r["level"].title()} risk, score {r["risk"]}</div></div>')
+    return "".join(items)
 
 
 def risk_score(blockage_pct: float, rain_mm: float, history: float) -> float:
@@ -320,14 +402,39 @@ for d in DRAINS:
     pct = a["blockage_percent"]
     if d["id"] == SENSOR_DRAIN and level_cm is not None and level_cm >= SENSOR_BLOCK_CM:
         pct = max(pct, min(100, int(level_cm / 60 * 100)))   # sensor confirms a blockage
-    score = risk_score(pct, rain, d["flood_history"])
+    hi = history_for(d["lat"], d["lon"])
+    fh = hi["weight"] if hi else d["flood_history"]      # past data if available, else hand-set value
+    score = risk_score(pct, rain, fh)
     lvl, color = level(score)
     rows.append({
         **d, "blockage_%": pct, "severity": a["severity"],
         "debris": ", ".join(a["debris_types"]), "confidence": a["confidence"],
         "why": a["reasoning"], "risk": score, "level": lvl, "color": color,
+        "past_overflows": hi["count"] if hi else None, "last_overflow": hi["last"] if hi else "n/a",
     })
 df = pd.DataFrame(rows).sort_values("risk", ascending=False)
+
+n_high = int((df["level"] == "HIGH").sum())
+n_med = int((df["level"] == "MEDIUM").sum())
+if n_high:
+    names = df[df["level"] == "HIGH"]["name"].tolist()
+    v_head = "Send crews to " + " and ".join(esc(n) for n in names[:2]) + (f" and {len(names) - 2} more" if len(names) > 2 else "")
+    v_sub = f"{n_high} of {len(df)} drains are blocked enough to flood at {rain:.0f} mm/hr."
+    v_col, v_bg = "#C8372D", "#FBE9E7"
+elif n_med:
+    v_head = "Keep an eye on " + " and ".join(esc(n) for n in df[df["level"] == "MEDIUM"]["name"].tolist()[:2])
+    v_sub = "Partly blocked. No crew needed at this rainfall."
+    v_col, v_bg = "#E39A1C", "#FFF3DC"
+else:
+    v_head = "No drain is at risk right now"
+    v_sub = f"At {rain:.0f} mm/hr, every inspected drain is clear enough."
+    v_col, v_bg = "#2E8B57", "#E3F2EA"
+st.markdown(
+    f'<div class="verdict" style="--c:{v_col};--bg:{v_bg}"><div class="v-head">{v_head}</div>'
+    f'<div class="v-sub">{v_sub}</div><div class="facts">'
+    f'<div class="fact"><b>{rain:.0f} mm/hr</b><span>{"Simulated rain" if simulate else "Forecast peak"}</span></div>'
+    f'<div class="fact"><b>{len(df)}</b><span>Drains inspected</span></div>'
+    f'<div class="fact"><b>{n_high}</b><span>At high risk</span></div></div></div>', unsafe_allow_html=True)
 
 tab_vision, tab_iot = st.tabs(["Vision & flood risk", "IoT live dashboard"])
 
@@ -335,9 +442,11 @@ with tab_vision:
     # ---------- Alerts ----------
     high = df[df["level"] == "HIGH"]
     if len(high):
-        st.error(f"ALERT: {len(high)} drain(s) at high flood risk with {rain:.0f} mm/hr rain expected. Dispatch crews now.")
+        st.markdown("#### Dispatch list")
         for _, r in high.iterrows():
-            st.write(f"- **{r['name']}**: {r['blockage_%']}% blocked ({r['debris']}), risk {r['risk']}")
+            hist_txt = (f" | {int(r['past_overflows'])} past overflow(s) within 500 m, last {r['last_overflow']}"
+                        if pd.notna(r["past_overflows"]) else "")
+            st.write(f"- **{r['name']}**: {r['blockage_%']}% blocked ({r['debris']}), risk {r['risk']}{hist_txt}")
         sent = st.session_state.setdefault("alerted", {})          # drain id -> time last alerted
         now = time.time()
         fresh = high[high["id"].map(lambda i: now - sent.get(i, 0) > cooldown_min * 60)]
@@ -356,7 +465,7 @@ with tab_vision:
                 for channel, (ok, info) in results_sent.items():
                     (st.success if ok else st.warning)(f"{channel}: {info}")
     else:
-        st.success("No drains at high risk under current rainfall.")
+        st.caption("No dispatch needed at the current rainfall.")
 
     # ---------- Map + ranked list ----------
     c1, c2 = st.columns([3, 2])
@@ -371,9 +480,11 @@ with tab_vision:
             tooltip={"text": "{name}\nBlockage: {blockage_%}%\nRisk: {risk} ({level})"},
         ))
     with c2:
-        st.subheader("Maintenance priority")
-        st.dataframe(df[["name", "blockage_%", "debris", "risk", "level"]],
-                     hide_index=True, use_container_width=True)
+        st.subheader("Crew queue")
+        st.markdown(queue_html(df), unsafe_allow_html=True)
+        with st.expander("All drain data"):
+            st.dataframe(df[["name", "blockage_%", "debris", "past_overflows", "last_overflow", "risk", "level"]],
+                         hide_index=True, use_container_width=True)
 
     # ---------- Drain detail + simulated sensor ----------
     st.subheader("Drain detail")
@@ -393,6 +504,23 @@ with tab_vision:
             st.line_chart([base + random.uniform(-1.5, 1.5) + i * sel["blockage_%"] / 100 * 0.9 for i in range(24)])
 
 
+
+with tab_vision:
+    st.subheader("Past overflow history")
+    h = load_history()
+    if h is None:
+        st.info(f"No {HISTORY_FILE} found. Add a CSV with columns date, area, lat, lon, description "
+                "to see areas with past drainage overflows.")
+    else:
+        by_area = (h.groupby("area").agg(incidents=("date", "count"), last_incident=("date", "max"))
+                   .sort_values("incidents", ascending=False))
+        by_area["last_incident"] = by_area["last_incident"].dt.strftime("%b %Y")
+        top = by_area.head(3)
+        st.write("Areas with repeated drainage overflows: " + "; ".join(
+            f"**{a}** ({int(r['incidents'])} incidents, last {r['last_incident']})" for a, r in top.iterrows()))
+        st.caption(f"Source: {HISTORY_FILE} ({len(h)} records). The flood-history weight in the risk score "
+                   "comes from incidents within 500 m of each drain, with recent ones counting more.")
+        st.dataframe(by_area, use_container_width=True)
 
 with tab_iot:
     st.caption("Browser dashboard: sample-drain map plus a live sensor view (MQTT / ThingSpeak). "
