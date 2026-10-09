@@ -1,0 +1,371 @@
+!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Smart Drain Guard</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.css">
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; background: #f2f5f9; color: #1c2733; }
+  .wrap { max-width: 1150px; margin: 0 auto; padding: 16px; }
+  .hero { background: linear-gradient(135deg, #0f4c81, #1ca3a3); color: #fff; border-radius: 16px; padding: 22px 26px; margin-bottom: 14px; }
+  .hero h1 { margin: 0; font-size: 1.9rem; }
+  .hero p { margin: 6px 0 0; opacity: .92; }
+  .stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-bottom: 14px; }
+  .card { border-radius: 14px; padding: 14px 18px; color: #fff; box-shadow: 0 2px 8px rgba(0,0,0,.15); }
+  .card b { display: block; font-size: 2.1rem; line-height: 1.1; }
+  .blue { background: #1f6feb; } .orange { background: #e8890c; } .red { background: #d93a3a; }
+  .banner { border-radius: 12px; padding: 14px 18px; font-weight: 600; margin-bottom: 14px; }
+  .b-high { background: #fde8e8; color: #9b1c1c; border: 1px solid #f5b5b5; }
+  .b-med { background: #fff4e0; color: #8a5200; border: 1px solid #f3d08a; }
+  .b-low { background: #e4f6ea; color: #17623a; border: 1px solid #a9dcbb; }
+  .grid { display: grid; grid-template-columns: 340px 1fr; gap: 14px; }
+  .panel { background: #fff; border-radius: 14px; padding: 16px; box-shadow: 0 1px 6px rgba(0,0,0,.08); margin-bottom: 14px; }
+  .panel h2 { margin: 0 0 10px; font-size: 1.1rem; }
+  label { font-size: .88rem; font-weight: 600; display: block; margin: 10px 0 4px; }
+  input[type=range] { width: 100%; }
+  input[type=text], select { width: 100%; padding: 8px; border: 1px solid #c8d1db; border-radius: 8px; }
+  button { margin-top: 10px; width: 100%; padding: 10px; border: 0; border-radius: 8px; background: #0f4c81; color: #fff; font-weight: 600; cursor: pointer; }
+  button:disabled { background: #9aa8b6; cursor: not-allowed; }
+  #preview { width: 100%; border-radius: 10px; margin-top: 10px; display: none; }
+  #result { margin-top: 10px; padding: 10px; border-radius: 8px; font-weight: 600; display: none; }
+  .r-blocked { background: #fde8e8; color: #9b1c1c; } .r-clear { background: #e4f6ea; color: #17623a; }
+  #map { height: 460px; border-radius: 12px; }
+  .legend { margin-top: 8px; font-size: .88rem; }
+  .dot { display: inline-block; width: 12px; height: 12px; border-radius: 50%; margin: 0 5px 0 12px; vertical-align: middle; }
+  table { width: 100%; border-collapse: collapse; font-size: .92rem; }
+  th, td { text-align: left; padding: 8px; border-bottom: 1px solid #e3e8ee; }
+  .tag { padding: 2px 10px; border-radius: 10px; color: #fff; font-size: .8rem; }
+  .iotNum { font-size: 1.7rem; margin-top: 6px; }
+  .iotNum b { font-size: 2.2rem; }
+  .gauge { height: 14px; background: #e3e8ee; border-radius: 8px; overflow: hidden; margin: 8px 0; }
+  #gaugeFill { height: 100%; width: 0; background: #2e9e5b; transition: width .6s, background .6s; }
+  #spark { width: 100%; height: 70px; }
+  .note { font-size: .8rem; color: #5b6b7b; margin-top: 6px; }
+  @media (max-width: 800px) { .grid { grid-template-columns: 1fr; } .stats { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="hero">
+    <h1>🌧️ Smart Drain Guard</h1>
+    <p>AI-based drain blockage detection and early flood warning system</p>
+  </div>
+
+  <div class="stats">
+    <div class="card blue"><b id="sTotal">0</b>Drains monitored</div>
+    <div class="card orange"><b id="sBlocked">0</b>Blocked drains</div>
+    <div class="card red"><b id="sHigh">0</b>High flood risk</div>
+  </div>
+
+  <div id="banner" class="banner b-low"></div>
+
+  <div class="grid">
+    <div>
+      <div class="panel">
+        <h2>Rainfall</h2>
+        <label for="rain">Rainfall: <span id="rainVal">35</span> mm/hour</label>
+        <input type="range" id="rain" min="0" max="120" value="35">
+        <label style="display:flex;gap:8px;align-items:center"><input type="checkbox" id="liveRain" style="width:auto"> Use live weather (Open-Meteo)</label>
+        <div class="note" id="rainNote">Manual mode: move the slider to simulate rainfall.</div>
+      </div>
+
+      <div class="panel">
+        <h2>Check a drain photo</h2>
+        <label for="modelUrl">Teachable Machine model link</label>
+        <input type="text" id="modelUrl" placeholder="https://teachablemachine.withgoogle.com/models/XXXX/">
+        <button id="loadBtn">Load model</button>
+        <div class="note" id="modelNote">Demo mode: no model loaded yet.</div>
+
+        <label for="file">Upload drain photo</label>
+        <input type="file" id="file" accept="image/*">
+        <img id="preview" alt="Uploaded drain">
+        <div id="result"></div>
+
+        <label for="drainSel">Which drain is this?</label>
+        <select id="drainSel"></select>
+        <button id="updateBtn" disabled>Update this drain's status</button>
+      </div>
+
+      <div class="panel">
+        <h2>📡 Live IoT sensor (S01)</h2>
+        <div class="note" id="iotMode">Simulated ESP32 + ultrasonic water-level sensor</div>
+        <div class="iotNum"><b id="iotLevel">8</b> cm <span id="iotTag" class="tag" style="background:#2e9e5b">Clear</span></div>
+        <div class="gauge"><div id="gaugeFill"></div></div>
+        <canvas id="spark" width="300" height="70"></canvas>
+        <div class="note" id="iotTime">Waiting for first reading...</div>
+        <button id="blockBtn">Simulate blockage</button>
+        <label for="mqttTopic">Real-time MQTT topic</label>
+        <input type="text" id="mqttTopic">
+        <button id="mqttBtn">Connect real-time feed</button>
+        <div class="note" id="mqttNote">Not connected. Publish a number (cm) to this topic from any MQTT client or an ESP32.</div>
+        <label for="chId">ThingSpeak channel ID (slower alternative)</label>
+        <input type="text" id="chId" placeholder="e.g. 1234567">
+        <button id="connectBtn">Connect real sensor</button>
+      </div>
+    </div>
+
+    <div>
+      <div class="panel">
+        <h2>Live drain map</h2>
+        <div id="map"></div>
+        <div class="legend">
+          <span class="dot" style="background:#d93a3a"></span>High risk
+          <span class="dot" style="background:#e8890c"></span>Medium risk
+          <span class="dot" style="background:#2e9e5b"></span>Low risk
+        </div>
+      </div>
+      <div class="panel">
+        <h2>Drains needing action</h2>
+        <table>
+          <thead><tr><th>Drain</th><th>Zone</th><th>Status</th><th>Water level</th><th>Risk</th></tr></thead>
+          <tbody id="rows"></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@1.3.1/dist/tf.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@teachablemachine/image@0.8/dist/teachablemachine-image.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/mqtt@5.10.1/dist/mqtt.min.js"></script>
+<script>
+// ---------- SETTINGS (edit these) ----------
+const MODEL_URL = "";                 // paste your Teachable Machine link here, or use the box on the page
+const CENTER = [12.9716, 77.5946];    // your city's [latitude, longitude]
+// -------------------------------------------
+
+const COLORS = { High: "#d93a3a", Medium: "#e8890c", Low: "#2e9e5b" };
+const $ = id => document.getElementById(id);
+
+// Simulated sensor data (seeded so it looks the same every time)
+function seeded(seed) {
+  return () => { seed |= 0; seed = seed + 0x6D2B79F5 | 0;
+    let t = Math.imul(seed ^ seed >>> 15, 1 | seed);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296; };
+}
+function makeDrains() {
+  const r = seeded(7), zones = ["Zone A", "Zone B", "Zone C", "Zone D"];
+  return Array.from({ length: 20 }, (_, i) => {
+    const blocked = r() < 0.35;
+    return { id: "D" + String(i + 1).padStart(2, "0"), zone: zones[Math.floor(r() * 4)],
+      lat: CENTER[0] + (r() - .5) * 0.06, lon: CENTER[1] + (r() - .5) * 0.06,
+      status: blocked ? "Blocked" : "Clear",
+      level: blocked ? 25 + Math.floor(r() * 35) : 2 + Math.floor(r() * 18) };
+  });
+}
+let drains = makeDrains();
+drains.push({ id: "S01", zone: "Zone A", lat: CENTER[0] + 0.004, lon: CENTER[1] - 0.004, status: "Clear", level: 8, iot: true });
+
+function risk(d, rain) {
+  if (d.status === "Blocked" && rain >= 30) return "High";
+  if (d.status === "Blocked" && rain >= 10) return "Medium";
+  if (d.status === "Clear" && rain >= 80) return "Medium";
+  return "Low";
+}
+
+// Map
+const map = L.map("map").setView(CENTER, 13);
+L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", { maxZoom: 19, attribution: "© OpenStreetMap" }).addTo(map);
+const layer = L.layerGroup().addTo(map);
+
+drains.filter(d => !d.iot).forEach(d => $("drainSel").add(new Option(d.id + " (" + d.zone + ")", d.id)));
+
+function render() {
+  const rain = +$("rain").value;
+  $("rainVal").textContent = rain;
+  const rows = drains.map(d => ({ ...d, risk: risk(d, rain) }));
+  const high = rows.filter(r => r.risk === "High"), med = rows.filter(r => r.risk === "Medium");
+
+  $("sTotal").textContent = rows.length;
+  $("sBlocked").textContent = rows.filter(r => r.status === "Blocked").length;
+  $("sHigh").textContent = high.length;
+
+  const b = $("banner");
+  if (high.length) {
+    const zones = [...new Set(high.map(r => r.zone))].sort().join(", ");
+    b.className = "banner b-high";
+    b.textContent = "🚨 FLOOD WARNING: HIGH risk in " + zones + ". Send cleaning crews to: " + high.map(r => r.id).join(", ");
+  } else if (med.length) {
+    b.className = "banner b-med";
+    b.textContent = "⚠️ Moderate flood risk. Watch drains: " + med.map(r => r.id).join(", ");
+  } else {
+    b.className = "banner b-low";
+    b.textContent = "✅ No flood risk at the current rainfall level.";
+  }
+
+  layer.clearLayers();
+  rows.forEach(r => { L.circleMarker([r.lat, r.lon], {
+    radius: r.risk === "High" ? 12 : 8, color: COLORS[r.risk], fillColor: COLORS[r.risk], fillOpacity: .8
+  }).bindPopup("<b>" + r.id + "</b> (" + r.zone + ")<br>Status: " + r.status +
+    "<br>Water level: " + r.level + " cm<br>Flood risk: " + r.risk + (r.iot ? "<br>📡 Live IoT sensor" : "")).addTo(layer);
+    if (r.iot) L.circleMarker([r.lat, r.lon], { radius: 18, color: "#0f4c81", weight: 2, fill: false }).addTo(layer);
+  });
+
+  const order = { High: 0, Medium: 1 };
+  const todo = rows.filter(r => r.risk !== "Low").sort((a, b) => order[a.risk] - order[b.risk]);
+  $("rows").innerHTML = todo.length ? todo.map(r =>
+    "<tr><td>" + r.id + "</td><td>" + r.zone + "</td><td>" + r.status + "</td><td>" + r.level +
+    " cm</td><td><span class='tag' style='background:" + COLORS[r.risk] + "'>" + r.risk + "</span></td></tr>"
+  ).join("") : "<tr><td colspan='5'>No drains need action right now.</td></tr>";
+}
+$("rain").addEventListener("input", render);
+
+// AI model (Teachable Machine, runs in the browser)
+let model = null;
+async function loadModel(url) {
+  if (!url) return;
+  if (!url.endsWith("/")) url += "/";
+  $("modelNote").textContent = "Loading model...";
+  try {
+    model = await tmImage.load(url + "model.json", url + "metadata.json");
+    $("modelNote").textContent = "✅ Model loaded. Using your trained AI.";
+  } catch (e) {
+    model = null;
+    $("modelNote").textContent = "Could not load the model. Check the link. Using demo mode.";
+  }
+}
+$("loadBtn").onclick = () => loadModel($("modelUrl").value.trim());
+if (MODEL_URL) { $("modelUrl").value = MODEL_URL; loadModel(MODEL_URL); }
+
+let lastStatus = null;
+$("file").onchange = () => {
+  const f = $("file").files[0];
+  if (!f) return;
+  const img = $("preview");
+  img.onload = async () => {
+    let status, conf;
+    if (model) {
+      const preds = await model.predict(img);
+      preds.sort((a, b) => b.probability - a.probability);
+      status = /block/i.test(preds[0].className) ? "Blocked" : "Clear";
+      conf = preds[0].probability;
+    } else {                                   // demo mode
+      status = f.size % 2 ? "Blocked" : "Clear";
+      conf = 0.78 + (f.size % 20) / 100;
+    }
+    lastStatus = status;
+    const res = $("result");
+    res.style.display = "block";
+    res.className = status === "Blocked" ? "r-blocked" : "r-clear";
+    res.textContent = "Result: " + status.toUpperCase() + " (" + Math.round(conf * 100) + "% confidence)" + (model ? "" : " [demo]");
+    $("updateBtn").disabled = false;
+  };
+  img.src = URL.createObjectURL(f);
+  img.style.display = "block";
+};
+
+$("updateBtn").onclick = () => {
+  const d = drains.find(x => x.id === $("drainSel").value);
+  d.status = lastStatus;
+  d.level = lastStatus === "Blocked" ? 45 : 8;
+  render();
+};
+
+// ---------- IoT sensor (simulated ESP32 + ultrasonic sensor, or real via ThingSpeak) ----------
+const iot = drains.find(d => d.iot);
+const IOT_THRESHOLD = 25;          // cm of water that counts as blocked
+const history = [];
+let simBlocked = false, liveMode = false, pollTimer = null;
+
+function drawSpark() {
+  const c = $("spark"), g = c.getContext("2d");
+  const y = v => c.height - 4 - (Math.min(v, 60) / 60) * (c.height - 8);
+  g.clearRect(0, 0, c.width, c.height);
+  g.strokeStyle = "#d93a3a"; g.lineWidth = 1; g.setLineDash([4, 4]);
+  g.beginPath(); g.moveTo(0, y(IOT_THRESHOLD)); g.lineTo(c.width, y(IOT_THRESHOLD)); g.stroke();
+  g.setLineDash([]); g.strokeStyle = "#0f4c81"; g.lineWidth = 2; g.beginPath();
+  history.forEach((v, i) => { const px = i / 29 * c.width; i ? g.lineTo(px, y(v)) : g.moveTo(px, y(v)); });
+  g.stroke();
+}
+
+function applyReading(level) {
+  const prev = iot.status;
+  iot.level = Math.round(level * 10) / 10;
+  iot.status = iot.level >= IOT_THRESHOLD ? "Blocked" : "Clear";
+  history.push(iot.level); if (history.length > 30) history.shift();
+  const col = iot.status === "Blocked" ? COLORS.High : COLORS.Low;
+  $("iotLevel").textContent = iot.level;
+  $("iotTag").textContent = iot.status; $("iotTag").style.background = col;
+  $("gaugeFill").style.width = Math.min(100, iot.level / 60 * 100) + "%";
+  $("gaugeFill").style.background = col;
+  $("iotTime").textContent = "Last reading: " + new Date().toLocaleTimeString();
+  drawSpark();
+  if (iot.status !== prev) render();
+}
+
+setInterval(() => {                 // simulated sensor sends a reading every 2 seconds
+  if (liveMode) return;
+  const target = simBlocked ? 50 : 8;
+  applyReading(Math.max(0, iot.level + (target - iot.level) * 0.25 + (Math.random() - .5) * 2));
+}, 2000);
+
+$("blockBtn").onclick = () => {
+  simBlocked = !simBlocked;
+  $("blockBtn").textContent = simBlocked ? "Clear the blockage" : "Simulate blockage";
+};
+
+$("connectBtn").onclick = () => {
+  const id = $("chId").value.trim();
+  if (!id) return;
+  liveMode = true; clearInterval(pollTimer);
+  $("iotMode").textContent = "Live: ThingSpeak channel " + id;
+  const poll = async () => {
+    try {
+      const j = await (await fetch("https://api.thingspeak.com/channels/" + id + "/feeds/last.json")).json();
+      const v = parseFloat(j.field1);
+      if (!isNaN(v)) applyReading(v);
+    } catch (e) {}
+  };
+  poll(); pollTimer = setInterval(poll, 15000);
+};
+
+// ---------- Real-time sensor feed over MQTT (public HiveMQ broker, no sign-up) ----------
+let mqttClient = null;
+$("mqttTopic").value = "smartdrainguard/" + Math.random().toString(36).slice(2, 8) + "/level";
+$("mqttBtn").onclick = () => {
+  const topic = $("mqttTopic").value.trim();
+  if (!topic) return;
+  if (mqttClient) mqttClient.end(true);
+  $("mqttNote").textContent = "Connecting...";
+  mqttClient = mqtt.connect("wss://broker.hivemq.com:8884/mqtt");
+  mqttClient.on("connect", () => {
+    mqttClient.subscribe(topic);
+    liveMode = true; clearInterval(pollTimer);
+    $("iotMode").textContent = "Live: MQTT topic " + topic;
+    $("mqttNote").textContent = "Connected. Waiting for a number (cm) on this topic.";
+  });
+  mqttClient.on("message", (tp, msg) => {
+    const v = parseFloat(msg.toString());
+    if (!isNaN(v)) applyReading(v);
+  });
+  mqttClient.on("error", () => { $("mqttNote").textContent = "Connection failed. Check your internet."; });
+};
+
+// ---------- Live rainfall (Open-Meteo, no API key) ----------
+let rainTimer = null;
+async function fetchRain() {
+  try {
+    const u = "https://api.open-meteo.com/v1/forecast?latitude=" + CENTER[0] + "&longitude=" + CENTER[1] + "&current=precipitation&timezone=auto";
+    const j = await (await fetch(u)).json();
+    const mm = Math.round(j.current.precipitation * 10) / 10;
+    $("rain").value = Math.min(120, mm);
+    $("rainNote").textContent = "Live: " + mm + " mm/hr, updated " + new Date().toLocaleTimeString();
+    render();
+  } catch (e) { $("rainNote").textContent = "Could not load live weather. Check your internet."; }
+}
+$("liveRain").onchange = () => {
+  clearInterval(rainTimer);
+  $("rain").disabled = $("liveRain").checked;
+  if ($("liveRain").checked) { fetchRain(); rainTimer = setInterval(fetchRain, 300000); }
+  else $("rainNote").textContent = "Manual mode: move the slider to simulate rainfall.";
+};
+
+applyReading(8);
+render();
+</script>
+</body>
+</html>
