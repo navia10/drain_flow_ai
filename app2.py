@@ -15,12 +15,15 @@ import pandas as pd
 import pydeck as pdk
 import requests
 import streamlit as st
+import streamlit.components.v1 as components
 from google import genai
 from google.genai import errors as genai_errors
 from google.genai import types
 
-MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
+MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.7-flash")
 BASE_LAT, BASE_LON = 28.6139, 77.2090  # TODO: set to your demo area
+SENSOR_DRAIN = "D2"      # which drain the IoT sensor is installed in
+SENSOR_BLOCK_CM = 25     # water level (cm) that counts as blocked
 CACHE_FILE = "results_cache.json"       # saved Gemini results, survives restarts
 
 # One entry per drain photo. Coordinates are made up around BASE_LAT/LON.
@@ -107,13 +110,25 @@ def forecast_max_rain(lat: float, lon: float) -> float:
         return 0.0
 
 
+@st.cache_data(ttl=10, show_spinner=False)
+def read_thingspeak(channel_id: str, api_key: str = ""):
+    """Latest water level (cm) from field1 of a ThingSpeak channel, or None."""
+    try:
+        params = {"api_key": api_key} if api_key else {}
+        j = requests.get(f"https://api.thingspeak.com/channels/{channel_id}/feeds/last.json",
+                         params=params, timeout=8).json()
+        return float(j["field1"])
+    except Exception:
+        return None
+
+
 def risk_score(blockage_pct: float, rain_mm: float, history: float) -> float:
     rain_factor = min(rain_mm / 20.0, 1.0)  # 20 mm/hr ~ very heavy rain
     return round((blockage_pct / 100) * (0.3 + 0.7 * rain_factor) * (0.7 + 0.3 * history), 3)
 
 
 def level(score: float):
-    if score >= 0.5:
+    if score >= 0.45:
         return "HIGH", [220, 40, 40]
     if score >= 0.25:
         return "MEDIUM", [240, 160, 30]
@@ -126,6 +141,29 @@ live_rain = forecast_max_rain(BASE_LAT, BASE_LON)
 st.sidebar.metric("Forecast peak (next 24h)", f"{live_rain:.1f} mm/hr")
 simulate = st.sidebar.checkbox("Simulate heavy rain")
 rain = st.sidebar.slider("Simulated rain (mm/hr)", 0, 50, 25) if simulate else live_rain
+
+# ---------- IoT sensor (simulated, or real ESP32 via ThingSpeak) ----------
+st.sidebar.header("IoT sensor")
+sensor_src = st.sidebar.radio("Source", ["Simulated", "ThingSpeak (real ESP32)"])
+st.session_state.setdefault("sensor_hist", [])
+hist = st.session_state["sensor_hist"]
+if sensor_src == "Simulated":
+    sim_block = st.sidebar.checkbox("Simulate blockage")
+    last = hist[-1] if hist else 8.0
+    target = 50 if sim_block else 8
+    level_cm = max(0.0, last + (target - last) * 0.35 + random.uniform(-1, 1))
+else:
+    ch = st.sidebar.text_input("ThingSpeak channel ID")
+    key = st.sidebar.text_input("Read API key (only if channel is private)", type="password")
+    level_cm = read_thingspeak(ch, key) if ch else None
+    if ch and level_cm is None:
+        st.sidebar.warning("No reading yet. Check the channel ID and that field1 has data.")
+if level_cm is not None:
+    hist.append(round(level_cm, 1))
+    del hist[:-30]
+    st.sidebar.metric(f"Water level ({SENSOR_DRAIN})", f"{level_cm:.1f} cm",
+                      "BLOCKED" if level_cm >= SENSOR_BLOCK_CM else "clear", delta_color="off")
+auto_refresh = st.sidebar.checkbox("Auto-refresh sensor (10 s)")
 
 # ---------- Analyze drains ----------
 if "results" not in st.session_state:
@@ -160,10 +198,13 @@ for d in DRAINS:
     a = results.get(d["id"])
     if not a:
         continue
-    score = risk_score(a["blockage_percent"], rain, d["flood_history"])
+    pct = a["blockage_percent"]
+    if d["id"] == SENSOR_DRAIN and level_cm is not None and level_cm >= SENSOR_BLOCK_CM:
+        pct = max(pct, min(100, int(level_cm / 60 * 100)))   # sensor confirms a blockage
+    score = risk_score(pct, rain, d["flood_history"])
     lvl, color = level(score)
     rows.append({
-        **d, "blockage_%": a["blockage_percent"], "severity": a["severity"],
+        **d, "blockage_%": pct, "severity": a["severity"],
         "debris": ", ".join(a["debris_types"]), "confidence": a["confidence"],
         "why": a["reasoning"], "risk": score, "level": lvl, "color": color,
     })
@@ -193,7 +234,7 @@ with c1:
 with c2:
     st.subheader("Maintenance priority")
     st.dataframe(df[["name", "blockage_%", "debris", "risk", "level"]],
-                 hide_index=True, width="stretch")
+                 hide_index=True, use_container_width=True)
 
 # ---------- Drain detail + simulated sensor ----------
 st.subheader("Drain detail")
@@ -203,7 +244,22 @@ d1, d2 = st.columns(2)
 with d1:
     st.image(sel["file"], caption=f"{sel['severity']} - {sel['why']}")
 with d2:
-    st.caption("Water level sensor (SIMULATED)")
-    random.seed(sel["id"])
-    base = 18
-    st.line_chart([base + random.uniform(-1.5, 1.5) + i * sel["blockage_%"] / 100 * 0.9 for i in range(24)])
+    if sel["id"] == SENSOR_DRAIN and hist:
+        st.caption("Water level sensor (" + ("SIMULATED" if sensor_src == "Simulated" else "LIVE via ThingSpeak") + ")")
+        st.line_chart(hist)
+    else:
+        st.caption("Water level sensor (SIMULATED)")
+        random.seed(sel["id"])
+        base = 18
+        st.line_chart([base + random.uniform(-1.5, 1.5) + i * sel["blockage_%"] / 100 * 0.9 for i in range(24)])
+
+
+# ---------- Embedded browser dashboard (MQTT / ThingSpeak live view) ----------
+if os.path.exists("drain_guard.html"):
+    with st.expander("Live IoT dashboard (MQTT view, runs in the browser)"):
+        with open("drain_guard.html", encoding="utf-8") as f:
+            components.html(f.read(), height=1500, scrolling=True)
+
+if auto_refresh:
+    time.sleep(10)
+    st.rerun()
