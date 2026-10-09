@@ -5,4 +5,4 @@ requests
 pandas
 pydeck
 numpy
-
+paho-mqtt>=2.0

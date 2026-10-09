@@ -5,6 +5,7 @@ Setup: pip install streamlit google-genai pillow requests pandas pydeck
        set GEMINI_API_KEY in your environment
 Put drain photos in a ./drains folder and list them in DRAINS below.
 """
+# pyright: basic
 import hashlib
 import json
 import math
