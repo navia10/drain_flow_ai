@@ -1,0 +1,6 @@
+@"
+__pycache__/
+.env
+.venv/
+.streamlit/secrets.toml
+"@ | Out-File -Encoding utf8 .gitignore
