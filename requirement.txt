@@ -1,0 +1,9 @@
+@"
+streamlit
+google-genai
+pillow
+requests
+pandas
+pydeck
+numpy
+"@ | Out-File -Encoding utf8 requirements.txt
